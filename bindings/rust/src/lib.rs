@@ -8,21 +8,9 @@
 
 use std::any::Any;
 use std::mem::transmute;
-use std::sync::{atomic::*, mpsc::channel, Arc, Mutex, Once};
+use std::sync::{atomic::*, mpsc::channel, Arc};
 use std::{ptr, slice};
-use threadpool::ThreadPool;
 use zeroize::Zeroize;
-
-fn da_pool() -> ThreadPool {
-    static INIT: Once = Once::new();
-    static mut POOL: *const Mutex<ThreadPool> = 0 as *const Mutex<ThreadPool>;
-
-    INIT.call_once(|| {
-        let pool = Mutex::new(ThreadPool::default());
-        unsafe { POOL = transmute(Box::new(pool)) };
-    });
-    unsafe { (*POOL).lock().unwrap().clone() }
-}
 
 include!("bindings.rs");
 
@@ -702,7 +690,6 @@ macro_rules! sig_variant_impl {
 
                 // TODO - check msg uniqueness?
 
-                let pool = da_pool();
                 let (tx, rx) = channel();
                 let counter = Arc::new(AtomicUsize::new(0));
                 let valid = Arc::new(AtomicBool::new(true));
@@ -717,52 +704,47 @@ macro_rules! sig_variant_impl {
                 let dst =
                     unsafe { slice::from_raw_parts(dst.as_ptr(), dst.len()) };
 
-                let n_workers = std::cmp::min(pool.max_count(), n_elems);
-                for _ in 0..n_workers {
-                    let tx = tx.clone();
-                    let counter = counter.clone();
-                    let valid = valid.clone();
+                let tx = tx.clone();
+                let counter = counter.clone();
+                let valid = valid.clone();
 
-                    pool.execute(move || {
-                        let mut pairing = Pairing::new($hash_or_encode, dst);
-                        // reconstruct input slices...
-                        let msgs = unsafe {
-                            slice::from_raw_parts(
-                                transmute::<usize, *const &[u8]>(raw_msgs),
-                                n_elems,
-                            )
-                        };
-                        let pks = unsafe {
-                            slice::from_raw_parts(
-                                transmute::<usize, *const &PublicKey>(raw_pks),
-                                n_elems,
-                            )
-                        };
+                let mut pairing = Pairing::new($hash_or_encode, dst);
+                // reconstruct input slices...
+                let msgs = unsafe {
+                    slice::from_raw_parts(
+                        transmute::<usize, *const &[u8]>(raw_msgs),
+                        n_elems,
+                    )
+                };
+                let pks = unsafe {
+                    slice::from_raw_parts(
+                        transmute::<usize, *const &PublicKey>(raw_pks),
+                        n_elems,
+                    )
+                };
 
-                        while valid.load(Ordering::Relaxed) {
-                            let work = counter.fetch_add(1, Ordering::Relaxed);
-                            if work >= n_elems {
-                                break;
-                            }
-                            if pairing.aggregate(
-                                &pks[work].point,
-                                pks_validate,
-                                &unsafe { ptr::null::<$sig_aff>().as_ref() },
-                                false,
-                                &msgs[work],
-                                &[],
-                            ) != BLST_ERROR::BLST_SUCCESS
-                            {
-                                valid.store(false, Ordering::Relaxed);
-                                break;
-                            }
-                        }
-                        if valid.load(Ordering::Relaxed) {
-                            pairing.commit();
-                        }
-                        tx.send(pairing).expect("disaster");
-                    });
+                while valid.load(Ordering::Relaxed) {
+                    let work = counter.fetch_add(1, Ordering::Relaxed);
+                    if work >= n_elems {
+                        break;
+                    }
+                    if pairing.aggregate(
+                        &pks[work].point,
+                        pks_validate,
+                        &unsafe { ptr::null::<$sig_aff>().as_ref() },
+                        false,
+                        &msgs[work],
+                        &[],
+                    ) != BLST_ERROR::BLST_SUCCESS
+                    {
+                        valid.store(false, Ordering::Relaxed);
+                        break;
+                    }
                 }
+                if valid.load(Ordering::Relaxed) {
+                    pairing.commit();
+                }
+                tx.send(pairing).expect("disaster");
 
                 if sig_groupcheck && valid.load(Ordering::Relaxed) {
                     match self.validate(false) {
@@ -776,10 +758,7 @@ macro_rules! sig_variant_impl {
                     Pairing::aggregated(&mut gtsig, &self.point);
                 }
 
-                let mut acc = rx.recv().unwrap();
-                for _ in 1..n_workers {
-                    acc.merge(&rx.recv().unwrap());
-                }
+                let acc = rx.recv().unwrap();
 
                 if valid.load(Ordering::Relaxed)
                     && acc.finalverify(Some(&gtsig))
@@ -845,7 +824,6 @@ macro_rules! sig_variant_impl {
 
                 // TODO - check msg uniqueness?
 
-                let pool = da_pool();
                 let (tx, rx) = channel();
                 let counter = Arc::new(AtomicUsize::new(0));
                 let valid = Arc::new(AtomicBool::new(true));
@@ -866,76 +844,68 @@ macro_rules! sig_variant_impl {
                 let dst =
                     unsafe { slice::from_raw_parts(dst.as_ptr(), dst.len()) };
 
-                let n_workers = std::cmp::min(pool.max_count(), n_elems);
-                for _ in 0..n_workers {
-                    let tx = tx.clone();
-                    let counter = counter.clone();
-                    let valid = valid.clone();
+                let tx = tx.clone();
+                let counter = counter.clone();
+                let valid = valid.clone();
 
-                    pool.execute(move || {
-                        let mut pairing = Pairing::new($hash_or_encode, dst);
-                        // reconstruct input slices...
-                        let rands = unsafe {
-                            slice::from_raw_parts(
-                                transmute::<usize, *const blst_scalar>(
-                                    raw_rands,
-                                ),
-                                n_elems,
-                            )
-                        };
-                        let msgs = unsafe {
-                            slice::from_raw_parts(
-                                transmute::<usize, *const &[u8]>(raw_msgs),
-                                n_elems,
-                            )
-                        };
-                        let sigs = unsafe {
-                            slice::from_raw_parts(
-                                transmute::<usize, *const &Signature>(raw_sigs),
-                                n_elems,
-                            )
-                        };
-                        let pks = unsafe {
-                            slice::from_raw_parts(
-                                transmute::<usize, *const &PublicKey>(raw_pks),
-                                n_elems,
-                            )
-                        };
+                let mut pairing = Pairing::new($hash_or_encode, dst);
+                // reconstruct input slices...
+                let rands = unsafe {
+                    slice::from_raw_parts(
+                        transmute::<usize, *const blst_scalar>(
+                            raw_rands,
+                        ),
+                        n_elems,
+                    )
+                };
+                let msgs = unsafe {
+                    slice::from_raw_parts(
+                        transmute::<usize, *const &[u8]>(raw_msgs),
+                        n_elems,
+                    )
+                };
+                let sigs = unsafe {
+                    slice::from_raw_parts(
+                        transmute::<usize, *const &Signature>(raw_sigs),
+                        n_elems,
+                    )
+                };
+                let pks = unsafe {
+                    slice::from_raw_parts(
+                        transmute::<usize, *const &PublicKey>(raw_pks),
+                        n_elems,
+                    )
+                };
 
-                        // TODO - engage multi-point mul-n-add for larger
-                        // amount of inputs...
-                        while valid.load(Ordering::Relaxed) {
-                            let work = counter.fetch_add(1, Ordering::Relaxed);
-                            if work >= n_elems {
-                                break;
-                            }
+                // TODO - engage multi-point mul-n-add for larger
+                // amount of inputs...
+                while valid.load(Ordering::Relaxed) {
+                    let work = counter.fetch_add(1, Ordering::Relaxed);
+                    if work >= n_elems {
+                        break;
+                    }
 
-                            if pairing.mul_n_aggregate(
-                                &pks[work].point,
-                                pks_validate,
-                                &sigs[work].point,
-                                sigs_groupcheck,
-                                &rands[work].b,
-                                rand_bits,
-                                msgs[work],
-                                &[],
-                            ) != BLST_ERROR::BLST_SUCCESS
-                            {
-                                valid.store(false, Ordering::Relaxed);
-                                break;
-                            }
-                        }
-                        if valid.load(Ordering::Relaxed) {
-                            pairing.commit();
-                        }
-                        tx.send(pairing).expect("disaster");
-                    });
+                    if pairing.mul_n_aggregate(
+                        &pks[work].point,
+                        pks_validate,
+                        &sigs[work].point,
+                        sigs_groupcheck,
+                        &rands[work].b,
+                        rand_bits,
+                        msgs[work],
+                        &[],
+                    ) != BLST_ERROR::BLST_SUCCESS
+                    {
+                        valid.store(false, Ordering::Relaxed);
+                        break;
+                    }
                 }
-
-                let mut acc = rx.recv().unwrap();
-                for _ in 1..n_workers {
-                    acc.merge(&rx.recv().unwrap());
+                if valid.load(Ordering::Relaxed) {
+                    pairing.commit();
                 }
+                tx.send(pairing).expect("disaster");
+
+                let acc = rx.recv().unwrap();
 
                 if valid.load(Ordering::Relaxed) && acc.finalverify(None) {
                     BLST_ERROR::BLST_SUCCESS
